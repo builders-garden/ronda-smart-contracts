@@ -17,24 +17,24 @@ enum VerificationType {
     SELF
 }
 
-contract RondaProtocolWIP is SelfVerificationRoot {
+contract RondaProtocol is SelfVerificationRoot {
 
     /* -------------------------------------------------------------------------- */
     /*                                BASIC STORAGE                               */
     /* -------------------------------------------------------------------------- */
 
-    IERC20 public usdc;    
+    IERC20 public usdc;
     address public creator;
 
     uint256 public groupId;
     bool public groupCreated;
     bool private initialized;
 
-    // simple membership management
+    // membership
     mapping(address => bool) public invited;
     mapping(address => bool) public members;
 
-    // basic verification
+    // verification
     VerificationType public verificationType;
     mapping(address => bool) public verifiedUsers;
 
@@ -43,23 +43,26 @@ contract RondaProtocolWIP is SelfVerificationRoot {
     bytes32 public verificationConfigId;
 
     /* -------------------------------------------------------------------------- */
-    /*                                    EVENTS                                  */
+    /*                               ROUND STRUCTURE                              */
     /* -------------------------------------------------------------------------- */
-    event GroupCreated(uint256 groupId, address creator);
-    event UserInvited(address user);
-    event UserJoined(address user);
-    event Deposit(address user, uint256 amount);
-    event VerificationCompleted(address user);
+
+    uint256 public currentRound;
+    uint256 public totalPool; // total USDC in contract
+
+    mapping(uint256 => mapping(address => uint256)) public roundDeposits;
+    mapping(address => uint256) public totalDepositedByUser;
 
     /* -------------------------------------------------------------------------- */
-    /*                                  ERRORS                                    */
+    /*                                    EVENTS                                  */
     /* -------------------------------------------------------------------------- */
-    error AlreadyInitialized();
-    error GroupNotCreated();
-    error NotInvited();
-    error AlreadyMember();
-    error NotMember();
-    error NotVerified();
+
+    event GroupCreated(uint256 groupId, address creator);
+    event UserInvited(address);
+    event UserJoined(address);
+    event Verified(address);
+
+    event Deposit(address indexed user, uint256 amount, uint256 round);
+    event WinnerSelected(address indexed winner, uint256 amount, uint256 round);
 
     /* -------------------------------------------------------------------------- */
     /*                                 CONSTRUCTOR                                */
@@ -67,8 +70,8 @@ contract RondaProtocolWIP is SelfVerificationRoot {
 
     constructor()
         SelfVerificationRoot(
-            0xe57F4773bd9c9d8b6Cd70431117d353298B9f5BF, /* hub address */
-            "ronda-wip"
+            0xe57F4773bd9c9d8b6Cd70431117d353298B9f5BF, 
+            "ronda-stage2"
         )
     {}
 
@@ -82,7 +85,7 @@ contract RondaProtocolWIP is SelfVerificationRoot {
         address identityVerificationHubV2Address,
         SelfUtils.UnformattedVerificationConfigV2 memory _verificationConfig
     ) external {
-        if (initialized) revert AlreadyInitialized();
+        require(!initialized, "Already initialized");
 
         groupId = _groupId;
         usdc = IERC20(_usdc);
@@ -107,8 +110,8 @@ contract RondaProtocolWIP is SelfVerificationRoot {
         require(!groupCreated, "Already created");
 
         creator = _creator;
-        groupCreated = true;
         verificationType = _verificationType;
+        groupCreated = true;
 
         members[_creator] = true;
 
@@ -125,9 +128,9 @@ contract RondaProtocolWIP is SelfVerificationRoot {
     /* -------------------------------------------------------------------------- */
 
     function joinGroup() external {
-        if (!groupCreated) revert GroupNotCreated();
-        if (!invited[msg.sender]) revert NotInvited();
-        if (members[msg.sender]) revert AlreadyMember();
+        require(groupCreated, "Group not created");
+        require(invited[msg.sender], "Not invited");
+        require(!members[msg.sender], "Already member");
 
         invited[msg.sender] = false;
         members[msg.sender] = true;
@@ -136,19 +139,56 @@ contract RondaProtocolWIP is SelfVerificationRoot {
     }
 
     /* -------------------------------------------------------------------------- */
-    /*                              SIMPLE DEPOSIT                                 */
+    /*                              SIMPLE DEPOSIT                                */
     /* -------------------------------------------------------------------------- */
 
     function deposit(uint256 amount) external {
-        if (!members[msg.sender]) revert NotMember();
+        require(members[msg.sender], "Not a member");
 
-        // only require SELF if selected
         if (verificationType == VerificationType.SELF) {
-            if (!verifiedUsers[msg.sender]) revert NotVerified();
+            require(verifiedUsers[msg.sender], "Not verified");
         }
 
         require(usdc.transferFrom(msg.sender, address(this), amount));
-        emit Deposit(msg.sender, amount);
+
+        roundDeposits[currentRound][msg.sender] += amount;
+        totalDepositedByUser[msg.sender] += amount;
+        totalPool += amount;
+
+        emit Deposit(msg.sender, amount, currentRound);
+    }
+
+    /* -------------------------------------------------------------------------- */
+    /*                          SIMPLE ROUND PAYOUT                                */
+    /* -------------------------------------------------------------------------- */
+
+    function payout(address[] calldata memberList) external {
+        require(groupCreated, "Group not created");
+        require(memberList.length > 0, "No members");
+
+        require(totalPool > 0, "No funds");
+
+        // very primitive randomness — will improve later
+        uint256 random = uint256(
+            keccak256(
+                abi.encodePacked(
+                    blockhash(block.number - 1),
+                    block.timestamp,
+                    currentRound,
+                    totalPool
+                )
+            )
+        );
+
+        address winner = memberList[random % memberList.length];
+
+        require(usdc.transfer(winner, totalPool));
+
+        emit WinnerSelected(winner, totalPool, currentRound);
+
+        // reset pool and move to next round
+        totalPool = 0;
+        currentRound += 1;
     }
 
     /* -------------------------------------------------------------------------- */
@@ -160,21 +200,16 @@ contract RondaProtocolWIP is SelfVerificationRoot {
         bytes memory
     ) internal override {
         address user = address(uint160(output.userIdentifier));
-
-        // only members can verify
-        if (!members[user]) {
-            // do nothing, ignore non-members
-            return;
-        }
+        if (!members[user]) return;
 
         verifiedUsers[user] = true;
-        emit VerificationCompleted(user);
+        emit Verified(user);
     }
 
     function getConfigId(
-        bytes32, /* destinationChainId */
-        bytes32, /* userIdentifier */
-        bytes memory /* userDefinedData */
+        bytes32,
+        bytes32,
+        bytes memory
     ) public view override returns (bytes32) {
         return verificationConfigId;
     }
