@@ -1,67 +1,103 @@
-## Foundry
+# Ronda Protocol
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+A decentralized rotating savings and credit association (ROSCA) protocol built on Celo, enabling groups to pool funds, and distribute funds to members on a rotating basis.
 
-Foundry consists of:
+## Overview
 
--   **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
--   **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
--   **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
--   **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+Ronda Protocol allows users to create savings groups where members make periodic deposits in USDC. Funds are automatically deposited into Aave, and the interest earned serves as a revenue stream for the protocol developers. On a rotating basis, a randomly selected member receives the accumulated principal funds. The protocol integrates with Self Protocol for identity verification, ensuring only verified users can participate.
 
-## Documentation
+## Contracts
 
-https://book.getfoundry.sh/
+### RondaProtocol
 
-## Usage
+Each `RondaProtocol` contract represents a single savings group. Key features:
+
+- **Periodic Deposits**: Members deposit a fixed amount at regular intervals
+- **Aave Integration**: Deposits are automatically supplied to Aave, with interest earned serving as protocol revenue
+- **Identity Verification**: Uses Self Protocol for proof of personhood and optional age/nationality/gender verification
+- **Fund Distribution**: Operator can distribute accumulated principal funds to eligible members
+- **ENS Support**: Each group can have an associated ENS subdomain (e.g., `mygroup.ronda.eth`)
+
+### RondaProtocolFactory
+
+Factory contract for deploying `RondaProtocol` instances using CREATE2 for deterministic addresses:
+
+- **CREATE2 Deployment**: Predictable contract addresses based on creator address and nonce
+- **ENS Reverse Registrar**: Implements ENS reverse registrar interface to assign subdomains to deployed contracts
+- **Group Management**: Tracks all deployed groups and assigns incremental group IDs
+
+## Key Integrations
+
+- **Celo**: Native deployment on Celo network using Circle USDC
+- **Aave V3**: Automatic supply of deposits to Aave Pool, with interest serving as protocol revenue
+- **Self Protocol**: Identity verification through Identity Verification Hub V2
+- **ENS**: Human-readable addresses via Ethereum Name Service
+
+## Contract Addresses
+
+### Celo Mainnet
+
+- **RondaProtocolFactory**: `0x3C8dFfF657093e03364f60848759454F459b03B6`
+
+## Development
 
 ### Build
 
-```shell
-$ forge build
+```bash
+forge build
 ```
 
 ### Test
 
-```shell
-$ forge test
+```bash
+forge test
 ```
 
-### Format
+### Deploy Factory
 
-```shell
-$ forge fmt
+```bash
+forge script script/DeployFactory.s.sol:DeployFactory \
+  --rpc-url https://forno.celo.org \
+  --broadcast \
+  --private-key $PRIVATE_KEY
 ```
 
-### Gas Snapshots
+### Deploy Ronda Protocol Instance
 
-```shell
-$ forge snapshot
+```bash
+forge script script/DeployRonda.s.sol:DeployRonda \
+  --rpc-url https://forno.celo.org \
+  --broadcast \
+  --private-key $PRIVATE_KEY
 ```
 
-### Anvil
+### Check Contract State
 
-```shell
-$ anvil
+```bash
+forge script script/CheckRondaState.s.sol:CheckRondaState \
+  --rpc-url https://forno.celo.org
 ```
 
-### Deploy
+### Generate ABIs
 
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
+```bash
+npm run extract-abis
 ```
 
-### Cast
+## Celo ETHGlobal Buenos Aires Submission
 
-```shell
-$ cast <subcommand>
-```
+### Celo Integration
 
-### Help
+Ronda Protocol is deployed on Celo and integrates with Celo's Circle USDC for deposits and withdrawals. The protocol leverages Aave V3 on Celo to automatically supply pooled funds, with the interest earned serving as a revenue stream for the protocol developers (via the fee recipient address). All transactions utilize Celo's low-cost, fast finality blockchain infrastructure.
 
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
-# ronda-smart-contracts
+### Project Description
+
+Ronda Protocol is a decentralized rotating savings and credit association that enables groups to pool funds, with Aave interest serving as protocol revenue, and distributes principal funds to members on a rotating basis with built-in identity verification.
+
+### Team
+
+The team is made by:
+
+- Limone: product and fullstack developer. Worked on contracts, design and webapp developement. X: @limone_eth, Farcaster:@limone.eth
+- Blackicon: fullstack developer. Worked on backend and webapp developement. X: @TBlackicon, Farcaster: @blackicon.eth
+- Mide: fullstack developer. Worked on backend developement. X: @itsmide_eth, Farcaster: @itsmide.eth
