@@ -319,7 +319,7 @@ contract RondaProtocol is SelfVerificationRoot {
      * @notice Constructor for RondaProtocol (minimal for CREATE2 compatibility)
      * @dev The contract must be initialized after deployment using initialize()
      */
-    constructor() SelfVerificationRoot(address(0), "") {
+    constructor() SelfVerificationRoot(0xe57F4773bd9c9d8b6Cd70431117d353298B9f5BF, "ronda-test") {
         // Empty constructor for CREATE2 compatibility
         // Contract must be initialized via initialize() function
     }
