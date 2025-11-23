@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
-
 import {SelfVerificationRoot} from "@selfxyz/contracts/abstract/SelfVerificationRoot.sol";
 import {ISelfVerificationRoot} from "@selfxyz/contracts/interfaces/ISelfVerificationRoot.sol";
 import {SelfStructs} from "@selfxyz/contracts/libraries/SelfStructs.sol";
 import {SelfUtils} from "@selfxyz/contracts/libraries/SelfUtils.sol";
 import {IIdentityVerificationHubV2} from "@selfxyz/contracts/interfaces/IIdentityVerificationHubV2.sol";
+import {IPool} from "@aave/core-v3/interfaces/IPool.sol";
 
-/// @notice Minimal ERC20 interface used in this contract
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -15,375 +14,911 @@ interface IERC20 {
     function approve(address spender, uint256 amount) external returns (bool);
 }
 
-/// @notice Minimal subset of Aave v3 Pool interface used here.
-interface IPool {
-    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
-    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
-}
-
-/// @notice Verification requirements for groups (kept small in this intermediate commit)
-enum VerificationType {
-    NONE,
-    SELF_BASE,        // proof of personhood only
-    SELF_AGE,         // proof of personhood + age requirement
-    SELF_NATIONALITY  // proof of personhood + nationality requirement
-}
-
 /**
- * @title RondaProtocol
- * @notice Group-based rotating savings contract with optional SELF verification and optional Aave supply integration.
- *   This is an incremental, well-documented commit: deposits can be auto-supplied to Aave (if configured) and payouts
- *   will withdraw from Aave when necessary. Verification hook marks members as verified. Comments and validation restored.
+ * @notice Enum defining verification requirements for groups
  */
+enum VerificationType {
+    NONE,                    // No verification required
+    SELF_BASE,              // Proof of personhood only
+    SELF_AGE,               // Proof of personhood + age verification
+    SELF_NATIONALITY,        // Proof of personhood + nationality verification
+    SELF_GENDER,            // Proof of personhood + gender verification
+    SELF_AGE_NATIONALITY,    // Proof of personhood + age + nationality
+    SELF_AGE_GENDER,        // Proof of personhood + age + gender
+    SELF_NATIONALITY_GENDER, // Proof of personhood + nationality + gender
+    SELF_ALL                // Proof of personhood + age + nationality + gender
+}
+
 contract RondaProtocol is SelfVerificationRoot {
-    /* -------------------------------------------------------------------------- */
-    /*                                   STORAGE                                  */
-    /* -------------------------------------------------------------------------- */
-
-    /// @notice USDC token contract (6 decimals)
+    // ============================================================================
+    // STATE VARIABLES
+    // ============================================================================
+    
+    /// @notice USDC token contract
     IERC20 public usdc;
-
-    /// @notice Optional Aave Pool to supply/withdraw USDC
+    
+    /// @notice Aave Pool contract for lending/borrowing
     IPool public aavePool;
-
-    /// @notice Optional aUSDC token address (interest-bearing counterpart)
+    
+    /// @notice Aave USDC aToken (interest-bearing token)
     IERC20 public aaveUsdc;
-
-    /// @notice Group creator (original deployer/creator assigned when createGroup is called)
-    address public creator;
-
-    /// @notice Unique group id assigned by factory / controller
+    
+    /// @notice Address to receive excess funds from interest
+    address public feeRecipient;
+    
+    /// @notice Operator address authorized to call distributeFunds
+    address public operator;
+    
+    /// @notice Group ID assigned by factory
     uint256 public groupId;
-
-    /// @notice Whether group was created
-    bool public groupCreated;
-
-    /// @notice Whether initialize() was called
-    bool public initialized;
-
-    /// @notice Verification rules for this group
-    VerificationType public verificationType;
-
-    /// @notice Per-member deposit amount for each round
-    uint256 public recurringAmount;
-
-    /// @notice Information tracked per member
-    struct MemberInfo {
-        bool exists;           // is in group
-        bool verified;         // passed SELF verification
-        bool hasWonThisCycle;  // has already won in current cycle
-    }
-
-    /// @notice Mapping from member address to info
-    mapping(address => MemberInfo) public memberInfo;
-
-    /// @notice Ordered list of members (used for round completion)
-    address[] public memberList;
-
-    /// @notice SELF verification configuration stored after initialize
+    
+    /// @notice Full ENS subdomain name (e.g., "mygroup.ronda.eth")
+    string public groupEnsName;
+    
+    /// @notice Verification configuration for Self Protocol
     SelfStructs.VerificationConfigV2 public verificationConfig;
+    
+    /// @notice Verification config ID from Identity Verification Hub
     bytes32 public verificationConfigId;
+    
+    /// @notice Initialization flag
+    bool private initialized;
+    
+    /// @notice Group creation flag
+    bool private groupCreated;
+    
+    /// @notice Mapping to track verified users (address => bool)
+    mapping(address => bool) public verifiedUsers;
+    
+    // ============================================================================
+    // CUSTOM ERRORS
+    // ============================================================================
+    
+    /// @notice Thrown when USDC address is invalid
+    error InvalidUSDCAddress();
+    
+    /// @notice Thrown when Aave Pool address is invalid
+    error InvalidAavePoolAddress();
+    
+    /// @notice Thrown when Aave USDC address is invalid
+    error InvalidAaveUSDCAddress();
+    
+    /// @notice Thrown when fee recipient address is invalid
+    error InvalidFeeRecipient();
+    
+    /// @notice Thrown when operator address is invalid
+    error InvalidOperatorAddress();
+    
+    /// @notice Thrown when Aave supply operation fails
+    error AaveSupplyFailed();
+    
+    /// @notice Thrown when Aave withdraw operation fails
+    error AaveWithdrawFailed();
+    
+    /// @notice Thrown when Aave USDC transfer fails
+    error AaveUSDCTransferFailed();
+    
+    /// @notice Thrown when contract is already initialized
+    error AlreadyInitialized();
+    
+    /// @notice Thrown when contract is not initialized
+    error NotInitialized();
+    
+    /// @notice Thrown when address is not verified
+    error AddressNotVerified();
+    
+    /// @notice Thrown when verification type is invalid
+    error InvalidVerificationType();
+    
+    /// @notice Thrown when verification requirements are not met
+    error VerificationRequirementsNotMet();
+    
+    /// @notice Thrown when deposit frequency is zero
+    error DepositFrequencyMustBeGreaterThanZero();
+    
+    /// @notice Thrown when borrow frequency is zero
+    error BorrowFrequencyMustBeGreaterThanZero();
+    
+    /// @notice Thrown when recurring amount is zero
+    error RecurringAmountMustBeGreaterThanZero();
+    
+    /// @notice Thrown when operation counter is zero
+    error OperationCounterMustBeGreaterThanZero();
+    
+    /// @notice Thrown when group is already created
+    error GroupAlreadyCreated();
+    
+    /// @notice Thrown when group is not created
+    error GroupNotCreated();
+    
+    /// @notice Thrown when only creator can invite
+    error OnlyCreatorCanInvite();
+    
+    /// @notice Thrown when user address is invalid
+    error InvalidUserAddress();
+    
+    /// @notice Thrown when user is already a member
+    error UserAlreadyMember();
+    
+    /// @notice Thrown when user is not invited
+    error UserNotInvited();
+    
+    /// @notice Thrown when address is not a member
+    error NotAMember();
+    
+    /// @notice Thrown when all operations are completed
+    error AllOperationsCompleted();
+    
+    /// @notice Thrown when user already deposited in this period
+    error AlreadyDepositedInThisPeriod();
+    
+    /// @notice Thrown when USDC transfer fails
+    error USDCTransferFailed();
+    
+    /// @notice Thrown when borrow frequency is not reached
+    error BorrowFrequencyNotReached();
+    
+    /// @notice Thrown when no members are provided
+    error NoMembersProvided();
+    
+    /// @notice Thrown when member is invalid
+    error InvalidMember();
+    
+    /// @notice Thrown when there are no funds to distribute
+    error NoFundsToDistribute();
+    
+    /// @notice Thrown when there are no members
+    error NoMembers();
+    
+    /// @notice Thrown when caller is not the operator
+    error OnlyOperator();
+    
+    // ============================================================================
+    // GROUP DATA (Contract represents a single group)
+    // ============================================================================
+    
+    /// @notice Address of the group creator
+    address public creator;
+    
+    /// @notice Mapping to track group members (address => bool)
+    mapping(address => bool) public members;
+    
+    /// @notice Mapping to track invited users (address => bool)
+    mapping(address => bool) public invitedUsers;
+    
+    /// @notice Verification type required for this group
+    VerificationType public verificationType;
+    
+    /// @notice Time between deposit periods (in seconds)
+    uint256 public depositFrequency;
+    
+    /// @notice Time between borrow/distribution periods (in seconds)
+    uint256 public borrowFrequency;
+    
+    /// @notice Amount each user should deposit per period (in USDC, 6 decimals)
+    uint256 public recurringAmount;
+    
+    /// @notice Total number of times the operation must be run (set by creator)
+    uint256 public operationCounter;
+    
+    /// @notice Current index of operation (0 to operationCounter-1)
+    uint256 public currentOperationIndex;
+    
+    /// @notice Mapping to track deposits per period (operationIndex => user => hasDeposited)
+    mapping(uint256 => mapping(address => bool)) public hasDeposited;
+    
+    /// @notice Mapping to track total deposits per period (operationIndex => total deposits)
+    mapping(uint256 => uint256) public periodDeposits;
+    
+    /// @notice Timestamp of last deposit
+    uint256 public lastDepositTime;
+    
+    /// @notice Timestamp of last borrow/distribution
+    uint256 public lastBorrowTime;
+    
+    // Optional verification parameters
+    /// @notice Minimum age requirement (if age verification is required)
+    uint256 public minAge;
+    
+    /// @notice List of allowed nationalities (if nationality verification is required, empty array means no restriction)
+    string[] public allowedNationalities;
+    
+    /// @notice Required gender (if gender verification is required)
+    string public requiredGender;
+    
+    // ============================================================================
+    // EVENTS
+    // ============================================================================
+    
+    /// @notice Emitted when a group is created
+    /// @param groupId The ID of the group
+    /// @param creator The address of the creator
+    /// @param depositFrequency Time between deposit periods (in seconds)
+    /// @param borrowFrequency Time between borrow/distribution periods (in seconds)
+    /// @param recurringAmount Amount each user should deposit per period
+    /// @param operationCounter Total number of operations
+    /// @param verificationType The verification type required
+    event GroupCreated(
+        uint256 indexed groupId, 
+        address indexed creator, 
+        uint256 depositFrequency, 
+        uint256 borrowFrequency, 
+        uint256 recurringAmount, 
+        uint256 operationCounter,
+        VerificationType verificationType
+    );
+    
+    /// @notice Emitted when a user is invited to join the group
+    /// @param groupId The ID of the group
+    /// @param user The address of the invited user
+    event UserInvited(uint256 indexed groupId, address indexed user);
+    
+    /// @notice Emitted when a user joins the group
+    /// @param groupId The ID of the group
+    /// @param user The address of the user who joined
+    event UserJoined(uint256 indexed groupId, address indexed user);
+    
+    /// @notice Emitted when a user makes a deposit
+    /// @param groupId The ID of the group
+    /// @param user The address of the user who deposited
+    /// @param amount The amount deposited
+    /// @param period The period index
+    event DepositMade(uint256 indexed groupId, address indexed user, uint256 amount, uint256 period);
+    
+    /// @notice Emitted when funds are distributed to a winner
+    /// @param groupId The ID of the group
+    /// @param winner The address of the winner
+    /// @param amount The amount distributed
+    /// @param period The period index
+    event FundsDistributed(uint256 indexed groupId, address indexed winner, uint256 amount, uint256 period);
+    
+    /// @notice Emitted when verification is completed successfully
+    /// @param groupId The ID of the group
+    /// @param verifiedAddress The address that was verified
+    /// @param output The verification output from the hub
+    event VerificationCompleted(
+        uint256 indexed groupId,
+        address indexed verifiedAddress,
+        ISelfVerificationRoot.GenericDiscloseOutputV2 output
+    );
+    
+    /// @notice Emitted when verification fails
+    /// @param groupId The ID of the group
+    /// @param addressAttempted The address that attempted verification
+    /// @param reason The reason for failure
+    event VerificationFailed(
+        uint256 indexed groupId,
+        address indexed addressAttempted,
+        string reason
+    );
 
-    /* ------------------------- Round deposit tracking ------------------------- */
-
-    /// @notice Current round index (0-based)
-    uint256 public currentRound;
-
-    /// @notice Total amount currently pooled (in USDC) for the round
-    uint256 public totalPool;
-
-    /// @notice Count of completed deposits this round
-    uint256 public depositsThisRound;
-
-    /// @notice Per-round deposit flag: round -> user -> deposited?
-    mapping(uint256 => mapping(address => bool)) public depositedInRound;
-
-    /* --------------------------------- Events -------------------------------- */
-
-    event GroupCreated(uint256 indexed groupId, address indexed creator);
-    event UserJoined(address indexed user);
-    event Verified(address indexed user);
-    event DepositMade(address indexed user, uint256 indexed round, uint256 amount);
-    event Winner(address indexed user, uint256 amount, uint256 round);
-
-    /* -------------------------------------------------------------------------- */
-    /*                                 CONSTRUCTOR                                */
-    /* -------------------------------------------------------------------------- */
-
+    /// @notice Thrown when verification fails
+    error VerificationFailedError(uint256 groupId, address addressAttempted, string reason);
+    
+    // ============================================================================
+    // MODIFIERS
+    // ============================================================================
+    
+    /// @notice Modifier to ensure contract is initialized
+    modifier onlyInitialized() {
+        if (!initialized) revert NotInitialized();
+        _;
+    }
+    
+    /// @notice Modifier to ensure only operator can call
+    modifier onlyOperator() {
+        if (msg.sender != operator) revert OnlyOperator();
+        _;
+    }
+    
+    // ============================================================================
+    // CONSTRUCTOR
+    // ============================================================================
+    
     /**
-     * @dev Calls SelfVerificationRoot constructor with a default hub and namespace.
-     *      Values may be replaced by initialize() in factory deployments.
+     * @notice Constructor for RondaProtocol (minimal for CREATE2 compatibility)
+     * @dev The contract must be initialized after deployment using initialize()
      */
-    constructor()
-        SelfVerificationRoot(
-            0xe57F4773bd9c9d8b6Cd70431117d353298B9f5BF,
-            "ronda"
-        )
-    {}
-
-    /* -------------------------------------------------------------------------- */
-    /*                                  INITIALIZE                                */
-    /* -------------------------------------------------------------------------- */
-
+    constructor() SelfVerificationRoot(address(0), "") {
+        // Empty constructor for CREATE2 compatibility
+        // Contract must be initialized via initialize() function
+    }
+    
+    // ============================================================================
+    // INITIALIZATION
+    // ============================================================================
+    
     /**
-     * @notice Initializes contract configuration that cannot be set in constructor (factory-friendly)
-     * @param _groupId Group id assigned by factory/controller
-     * @param _usdc Address of USDC token
-     * @param identityVerificationHubV2Address Address of IdentityVerificationHubV2 (used to register verification config)
-     * @param _aavePool Optional Aave Pool address (address(0) to disable Aave integration)
-     * @param _aaveUsdc Optional aUSDC token address (address(0) if not used)
-     * @param _verificationConfig SELF unformatted verification config (will be formatted and set in hub)
+     * @notice Initializes the RondaProtocol contract
+     * @param _groupId The group ID assigned by the factory
+     * @param _ensSubdomain The full ENS subdomain name (e.g., "mygroup.ronda.eth")
+     * @param _usdcAddress The address of the USDC token
+     * @param identityVerificationHubV2Address The address of the Identity Verification Hub V2
+     * @param _aavePoolAddress The address of the Aave Pool
+     * @param _aaveUsdcAddress The address of the Aave USDC aToken
+     * @param _feeRecipient The address to receive excess funds
+     * @param _operator The address authorized to call distributeFunds
+     * @param scopeSeed The scope seed string for verification
+     * @param _verificationConfig The verification configuration
      */
     function initialize(
         uint256 _groupId,
-        address _usdc,
+        string memory _ensSubdomain,
+        address _usdcAddress,
         address identityVerificationHubV2Address,
-        address _aavePool,
-        address _aaveUsdc,
+        address _aavePoolAddress,
+        address _aaveUsdcAddress,
+        address _feeRecipient,
+        address _operator,
+        string memory scopeSeed,
         SelfUtils.UnformattedVerificationConfigV2 memory _verificationConfig
     ) external {
-        require(!initialized, "Ronda: already initialized");
-        require(_usdc != address(0), "Ronda: usdc zero address");
-        require(identityVerificationHubV2Address != address(0), "Ronda: hub zero address");
-
+        if (initialized) revert AlreadyInitialized();
+        if (_usdcAddress == address(0)) revert InvalidUSDCAddress();
+        if (_aavePoolAddress == address(0)) revert InvalidAavePoolAddress();
+        if (_aaveUsdcAddress == address(0)) revert InvalidAaveUSDCAddress();
+        if (_feeRecipient == address(0)) revert InvalidFeeRecipient();
+        if (_operator == address(0)) revert InvalidOperatorAddress();
+        if (identityVerificationHubV2Address == address(0)) revert InvalidUSDCAddress();
+        
         initialized = true;
         groupId = _groupId;
-        usdc = IERC20(_usdc);
-
-        // optional Aave wiring; allow deployments that don't use Aave (address(0))
-        if (_aavePool != address(0)) {
-            aavePool = IPool(_aavePool);
-        }
-        if (_aaveUsdc != address(0)) {
-            aaveUsdc = IERC20(_aaveUsdc);
-        }
-
-        // format and set verification config in the IdentityVerificationHubV2
+        groupEnsName = _ensSubdomain;
+        usdc = IERC20(_usdcAddress);
+        aavePool = IPool(_aavePoolAddress);
+        aaveUsdc = IERC20(_aaveUsdcAddress);
+        feeRecipient = _feeRecipient;
+        operator = _operator;
+        
+        // Initialize the parent contract's verification config
         verificationConfig = SelfUtils.formatVerificationConfigV2(_verificationConfig);
-        verificationConfigId =
-            IIdentityVerificationHubV2(identityVerificationHubV2Address)
+        verificationConfigId = IIdentityVerificationHubV2(identityVerificationHubV2Address)
             .setVerificationConfigV2(verificationConfig);
     }
-
-    /* -------------------------------------------------------------------------- */
-    /*                               GROUP CREATION                               */
-    /* -------------------------------------------------------------------------- */
-
+    
+    // ============================================================================
+    // GROUP MANAGEMENT
+    // ============================================================================
+    
     /**
-     * @notice Create a new group and register its members.
-     * @dev This function is intentionally simple and requires the factory/controller
-     *      to call it after initialize(). Member list must be non-empty.
-     * @param _creator Creator address (is included as a member if not present)
-     * @param _verificationType Which verification requirements to enforce for deposits
-     * @param _recurringAmount Amount each member deposits per round (USDC smallest unit)
-     * @param _members Initial list of member addresses
+     * @notice Creates the group (called by factory after initialization)
+     * @param _creator The address of the group creator
+     * @param _depositFrequency Time between deposit periods (in seconds)
+     * @param _borrowFrequency Time between borrow/distribution periods (in seconds)
+     * @param _recurringAmount Amount each user should deposit per period (in USDC, 6 decimals)
+     * @param _operationCounter Total number of times the operation must be run
+     * @param _verificationType The type of verification required for this group
+     * @param _minAge Minimum age requirement (only used if age verification is required, 0 otherwise)
+     * @param _allowedNationalities List of allowed nationalities (only used if nationality verification is required, empty array means no restriction)
+     * @param _requiredGender Required gender (only used if gender verification is required, empty string otherwise)
+     * @param _usersToInvite Array of user addresses to invite when creating the group
      */
     function createGroup(
         address _creator,
-        VerificationType _verificationType,
+        uint256 _depositFrequency,
+        uint256 _borrowFrequency,
         uint256 _recurringAmount,
-        address[] memory _members
-    ) external {
-        require(initialized, "Ronda: not initialized");
-        require(!groupCreated, "Ronda: already created");
-        require(_creator != address(0), "Ronda: creator zero address");
-        require(_members.length > 0, "Ronda: no members");
-        require(_recurringAmount > 0, "Ronda: recurring amount zero");
-
+        uint256 _operationCounter,
+        VerificationType _verificationType,
+        uint256 _minAge,
+        string[] memory _allowedNationalities,
+        string memory _requiredGender,
+        address[] memory _usersToInvite
+    ) external onlyInitialized {
+        if (groupCreated) revert GroupAlreadyCreated();
+        if (_depositFrequency == 0) revert DepositFrequencyMustBeGreaterThanZero();
+        if (_borrowFrequency == 0) revert BorrowFrequencyMustBeGreaterThanZero();
+        if (_recurringAmount == 0) revert RecurringAmountMustBeGreaterThanZero();
+        if (_operationCounter == 0) revert OperationCounterMustBeGreaterThanZero();
+        if (uint256(_verificationType) > uint256(VerificationType.SELF_ALL)) revert InvalidVerificationType();
+        
+        groupCreated = true;
         creator = _creator;
         verificationType = _verificationType;
+        depositFrequency = _depositFrequency;
+        borrowFrequency = _borrowFrequency;
         recurringAmount = _recurringAmount;
-        groupCreated = true;
-
-        // add members; guard against duplicates in provided array
-        for (uint256 i = 0; i < _members.length; i++) {
-            address m = _members[i];
-            require(m != address(0), "Ronda: member zero address");
-            if (!memberInfo[m].exists) {
-                memberInfo[m] = MemberInfo({ exists: true, verified: false, hasWonThisCycle: false });
-                memberList.push(m);
-                emit UserJoined(m);
+        operationCounter = _operationCounter;
+        currentOperationIndex = 0;
+        lastDepositTime = block.timestamp;
+        lastBorrowTime = block.timestamp;
+        members[_creator] = true;
+        
+        // Set verification parameters if needed
+        if (_verificationType != VerificationType.NONE) {
+            // If age verification is required, minAge must be set
+            if (_verificationType == VerificationType.SELF_AGE || 
+                _verificationType == VerificationType.SELF_AGE_NATIONALITY ||
+                _verificationType == VerificationType.SELF_AGE_GENDER ||
+                _verificationType == VerificationType.SELF_ALL) {
+                minAge = _minAge;
+            }
+            
+            // If nationality verification is required, store allowed nationalities list
+            if (_verificationType == VerificationType.SELF_NATIONALITY ||
+                _verificationType == VerificationType.SELF_AGE_NATIONALITY ||
+                _verificationType == VerificationType.SELF_NATIONALITY_GENDER ||
+                _verificationType == VerificationType.SELF_ALL) {
+                allowedNationalities = _allowedNationalities;
+            }
+            
+            // If gender verification is required, requiredGender must be set
+            if (_verificationType == VerificationType.SELF_GENDER ||
+                _verificationType == VerificationType.SELF_AGE_GENDER ||
+                _verificationType == VerificationType.SELF_NATIONALITY_GENDER ||
+                _verificationType == VerificationType.SELF_ALL) {
+                requiredGender = _requiredGender;
             }
         }
-
-        // ensure creator is included
-        if (!memberInfo[_creator].exists) {
-            memberInfo[_creator] = MemberInfo({ exists: true, verified: false, hasWonThisCycle: false });
-            memberList.push(_creator);
-            emit UserJoined(_creator);
+        
+        // Invite users during group creation
+        for (uint256 i = 0; i < _usersToInvite.length; i++) {
+            address user = _usersToInvite[i];
+            if (user == address(0)) revert InvalidUserAddress();
+            if (user == _creator) continue; // Creator is already a member
+            if (members[user]) continue; // Already a member, skip
+            if (invitedUsers[user]) continue; // Already invited, skip
+            
+            invitedUsers[user] = true;
+            emit UserInvited(groupId, user);
         }
-
-        emit GroupCreated(groupId, _creator);
+        
+        emit GroupCreated(groupId, _creator, _depositFrequency, _borrowFrequency, _recurringAmount, _operationCounter, _verificationType);
     }
-
-    /* -------------------------------------------------------------------------- */
-    /*                                 DEPOSIT                                    */
-    /* -------------------------------------------------------------------------- */
-
+    
     /**
-     * @notice Deposits the fixed recurringAmount for the current round.
-     * @dev If Aave Pool is configured, the contract will approve and supply the USDC to Aave to earn interest.
-     *      Depositors must be registered members and, if verification is enabled, must be verified.
+     * @notice Allows an invited user to join the group
+     * @dev Users can join without verification, but must verify before depositing
+     * @dev Emits UserJoined event
      */
-    function deposit() external {
-        require(groupCreated, "Ronda: group not created");
-        require(memberInfo[msg.sender].exists, "Ronda: not a member");
-        require(!depositedInRound[currentRound][msg.sender], "Ronda: already deposited this round");
-
-        // If any verification is required, member must be verified
+    function joinGroup() external {
+        if (!groupCreated) revert GroupNotCreated();
+        if (!invitedUsers[msg.sender]) revert UserNotInvited();
+        if (members[msg.sender]) revert UserAlreadyMember();
+        
+        members[msg.sender] = true;
+        invitedUsers[msg.sender] = false; // Remove from invited list
+        
+        emit UserJoined(groupId, msg.sender);
+    }
+    
+    // ============================================================================
+    // DEPOSITS
+    // ============================================================================
+    
+    /**
+     * @notice Allows a member to deposit the recurring amount during the current deposit period
+     * @dev Requires verification if the group has verification requirements
+     * @dev Automatically supplies USDC to Aave Pool to earn interest
+     * @dev Emits DepositMade event
+     */
+    function deposit() external onlyInitialized {
+        if (!groupCreated) revert GroupNotCreated();
+        if (!members[msg.sender]) revert NotAMember();
+        
+        // Check verification requirements if group requires it
         if (verificationType != VerificationType.NONE) {
-            require(memberInfo[msg.sender].verified, "Ronda: member not verified");
+            if (!verifiedUsers[msg.sender]) {
+                revert AddressNotVerified();
+            }
         }
-
-        // Pull USDC from user
-        bool ok = usdc.transferFrom(msg.sender, address(this), recurringAmount);
-        require(ok, "Ronda: usdc transferFrom failed");
-
-        // Supply to Aave if configured to earn interest
-        if (address(aavePool) != address(0)) {
-            // Note: some ERC20s require approve(0) before changing allowance; keep simple here.
-            ok = usdc.approve(address(aavePool), recurringAmount);
-            require(ok, "Ronda: approve to aave failed");
-            aavePool.supply(address(usdc), recurringAmount, address(this), 0);
-            // aUSDC will be minted to this contract by Aave
+        
+        // Check if we need to start a new period
+        if (block.timestamp >= lastDepositTime + depositFrequency) {
+            // Move to next operation index
+            currentOperationIndex++;
+            lastDepositTime = block.timestamp;
         }
-
-        depositedInRound[currentRound][msg.sender] = true;
-        depositsThisRound += 1;
-        totalPool += recurringAmount;
-
-        emit DepositMade(msg.sender, currentRound, recurringAmount);
+        
+        if (currentOperationIndex >= operationCounter) revert AllOperationsCompleted();
+        if (hasDeposited[currentOperationIndex][msg.sender]) revert AlreadyDepositedInThisPeriod();
+        
+        // Transfer USDC from user to contract
+        if (!usdc.transferFrom(msg.sender, address(this), recurringAmount)) {
+            revert USDCTransferFailed();
+        }
+        
+        // Approve Aave Pool to spend USDC
+        if (!usdc.approve(address(aavePool), recurringAmount)) {
+            revert USDCTransferFailed();
+        }
+        
+        // Supply USDC to Aave Pool
+        aavePool.supply(address(usdc), recurringAmount, address(this), 0);
+        
+        hasDeposited[currentOperationIndex][msg.sender] = true;
+        periodDeposits[currentOperationIndex] += recurringAmount;
+        
+        emit DepositMade(groupId, msg.sender, recurringAmount, currentOperationIndex);
     }
-
-    /* -------------------------------------------------------------------------- */
-    /*                             ROUND COMPLETION                                */
-    /* -------------------------------------------------------------------------- */
-
+    
+    // ============================================================================
+    // FUND DISTRIBUTION
+    // ============================================================================
+    
     /**
-     * @notice Finalize the round: pick a winner and pay out the pooled principal.
-     * @dev Withdraws principal from Aave if necessary. This commit intentionally does not
-     *      split interest or route fees — that is left for a following commit.
+     * @notice Distributes funds to a randomly selected member when borrow frequency is reached
+     * @dev Only the operator can call this function
+     * @dev Withdraws funds from Aave and sends excess interest to fee recipient
+     * @param _members Array of member addresses for random selection
+     * @dev Emits FundsDistributed event
      */
-    function payout() external {
-        require(groupCreated, "Ronda: group not created");
-        require(depositsThisRound == memberList.length, "Ronda: round incomplete");
-        require(totalPool > 0, "Ronda: nothing to pay");
-
-        address[] memory eligible = _eligibleMembers();
-        require(eligible.length > 0, "Ronda: no eligible members");
-
-        // Pseudorandom selection (not secure for high-value randomness; okay for this incremental commit)
-        uint256 random = uint256(
+    function distributeFunds(address[] calldata _members) external onlyInitialized onlyOperator {
+        if (!groupCreated) revert GroupNotCreated();
+        if (block.timestamp < lastBorrowTime + borrowFrequency) {
+            revert BorrowFrequencyNotReached();
+        }
+        if (_members.length == 0) revert NoMembersProvided();
+        
+        // Verify all provided addresses are members
+        for (uint256 i = 0; i < _members.length; i++) {
+            if (!members[_members[i]]) revert InvalidMember();
+        }
+        
+        // Get the period to distribute (current operation index)
+        uint256 periodToDistribute = currentOperationIndex;
+        uint256 amountToDistribute = periodDeposits[periodToDistribute];
+        
+        if (amountToDistribute == 0) revert NoFundsToDistribute();
+        
+        // Select a random member using pseudorandomity
+        address winner = _selectRandomMember(_members);
+        
+        // Update last borrow time
+        lastBorrowTime = block.timestamp;
+        
+        // Withdraw the exact amount needed for the winner
+        uint256 withdrawnAmount = aavePool.withdraw(address(usdc), amountToDistribute, winner);
+        
+        if (withdrawnAmount < amountToDistribute) {
+            revert AaveWithdrawFailed();
+        }
+        
+        // Check if there's any excess aUSDC in the contract (from interest)
+        uint256 contractBalance = aaveUsdc.balanceOf(address(this));
+        if (contractBalance > 0) {
+            // Send excess to fee recipient
+            if (!aaveUsdc.transfer(feeRecipient, contractBalance)) {
+                revert AaveUSDCTransferFailed();
+            }
+        }
+        
+        // Clear the period deposits
+        periodDeposits[periodToDistribute] = 0;
+        
+        emit FundsDistributed(groupId, winner, amountToDistribute, periodToDistribute);
+    }
+    
+    // ============================================================================
+    // INTERNAL HELPERS
+    // ============================================================================
+    
+    /**
+     * @notice Selects a random member using pseudorandomity
+     * @param _members Array of member addresses
+     * @return The selected member address
+     * @dev Uses blockhash, timestamp, and group data for randomness
+     */
+    function _selectRandomMember(address[] calldata _members) internal view returns (address) {
+        if (_members.length == 0) revert NoMembers();
+        
+        // Use blockhash, timestamp, and group data for pseudorandomity
+        uint256 randomSeed = uint256(
             keccak256(
                 abi.encodePacked(
                     blockhash(block.number - 1),
                     block.timestamp,
-                    currentRound,
-                    totalPool
+                    block.number,
+                    groupId,
+                    currentOperationIndex,
+                    _members.length
                 )
             )
         );
-        address winner = eligible[random % eligible.length];
-
-        // If funds are in Aave, withdraw exact principal to this contract
-        if (address(aavePool) != address(0)) {
-            uint256 withdrawn = aavePool.withdraw(address(usdc), totalPool, address(this));
-            require(withdrawn >= totalPool, "Ronda: aave withdraw short");
-        }
-
-        // Transfer pooled principal to the winner
-        bool sent = usdc.transfer(winner, totalPool);
-        require(sent, "Ronda: usdc transfer to winner failed");
-
-        emit Winner(winner, totalPool, currentRound);
-
-        // Mark winner for this cycle and rotate if everyone has won
-        memberInfo[winner].hasWonThisCycle = true;
-        if (_everyoneHasWon()) {
-            _resetWinCycle();
-        }
-
-        // Reset round bookkeeping
-        totalPool = 0;
-        depositsThisRound = 0;
-        currentRound += 1;
+        
+        uint256 randomIndex = randomSeed % _members.length;
+        return _members[randomIndex];
     }
-
-    /* -------------------------------------------------------------------------- */
-    /*                              HELPER FUNCTIONS                               */
-    /* -------------------------------------------------------------------------- */
-
-    /// @notice Returns members who have not yet won in the current cycle
-    function _eligibleMembers() internal view returns (address[] memory arr) {
-        uint256 count;
-        for (uint256 i = 0; i < memberList.length; i++) {
-            if (!memberInfo[memberList[i]].hasWonThisCycle) {
-                count++;
-            }
-        }
-
-        arr = new address[](count);
-        uint256 idx;
-        for (uint256 i = 0; i < memberList.length; i++) {
-            if (!memberInfo[memberList[i]].hasWonThisCycle) {
-                arr[idx++] = memberList[i];
-            }
-        }
-    }
-
-    /// @notice Returns true if every member has won at least once in current cycle
-    function _everyoneHasWon() internal view returns (bool) {
-        for (uint256 i = 0; i < memberList.length; i++) {
-            if (!memberInfo[memberList[i]].hasWonThisCycle) return false;
-        }
-        return true;
-    }
-
-    /// @notice Resets per-cycle winner tracking for all members.
-    function _resetWinCycle() internal {
-        for (uint256 i = 0; i < memberList.length; i++) {
-            memberInfo[memberList[i]].hasWonThisCycle = false;
-        }
-    }
-
-    /* -------------------------------------------------------------------------- */
-    /*                          SELF VERIFICATION HOOK                            */
-    /* -------------------------------------------------------------------------- */
-
+    
+    // ============================================================================
+    // VIEW FUNCTIONS - MEMBERSHIP
+    // ============================================================================
+    
     /**
-     * @notice Hook called by SelfVerificationRoot on successful verification.
-     * @dev This intermediate commit keeps the behavior simple: mark the member as verified.
-     *      Future commits will enforce age/nationality checks depending on verificationType.
+     * @notice Checks if an address is a member of the group
+     * @param _user The address to check
+     * @return True if the user is a member
+     */
+    function isMember(address _user) external view returns (bool) {
+        return members[_user];
+    }
+    
+    /**
+     * @notice Checks if an address is invited to the group
+     * @param _user The address to check
+     * @return True if the user is invited
+     */
+    function isInvited(address _user) external view returns (bool) {
+        return invitedUsers[_user];
+    }
+    
+    // ============================================================================
+    // VIEW FUNCTIONS - GROUP INFO
+    // ============================================================================
+    
+    /**
+     * @notice Gets basic group information
+     * @return _creator The creator address
+     * @return _verificationType The verification type required
+     * @return _depositFrequency The deposit frequency in seconds
+     * @return _borrowFrequency The borrow frequency in seconds
+     * @return _recurringAmount The recurring deposit amount
+     * @return _operationCounter The total number of operations
+     * @return _currentOperationIndex The current operation index
+     * @return _lastDepositTime The timestamp of last deposit
+     * @return _lastBorrowTime The timestamp of last borrow
+     * @return _minAge Minimum age requirement
+     * @return _allowedNationalities List of allowed nationalities
+     * @return _requiredGender Required gender
+     */
+    function getGroupInfo() external view returns (
+        address _creator,
+        VerificationType _verificationType,
+        uint256 _depositFrequency,
+        uint256 _borrowFrequency,
+        uint256 _recurringAmount,
+        uint256 _operationCounter,
+        uint256 _currentOperationIndex,
+        uint256 _lastDepositTime,
+        uint256 _lastBorrowTime,
+        uint256 _minAge,
+        string[] memory _allowedNationalities,
+        string memory _requiredGender
+    ) {
+        return (
+            creator,
+            verificationType,
+            depositFrequency,
+            borrowFrequency,
+            recurringAmount,
+            operationCounter,
+            currentOperationIndex,
+            lastDepositTime,
+            lastBorrowTime,
+            minAge,
+            allowedNationalities,
+            requiredGender
+        );
+    }
+    
+    // ============================================================================
+    // VIEW FUNCTIONS - DEPOSIT STATUS
+    // ============================================================================
+    
+    /**
+     * @notice Gets the deposit status for a user in a specific operation period
+     * @param _operationIndex The operation index to check
+     * @param _user The address to check
+     * @return True if the user has deposited in that operation period
+     */
+    function hasUserDeposited(uint256 _operationIndex, address _user) external view returns (bool) {
+        return hasDeposited[_operationIndex][_user];
+    }
+    
+    /**
+     * @notice Gets the deposit status for a user in a specific or current operation period
+     * @param _user The address to check
+     * @param _operationIndex The operation index to check (use type(uint256).max to check current period)
+     * @return True if the user has deposited in that period
+     */
+    function hasUserDepositedInPeriod(address _user, uint256 _operationIndex) external view returns (bool) {
+        uint256 periodIndex = _operationIndex == type(uint256).max ? currentOperationIndex : _operationIndex;
+        return hasDeposited[periodIndex][_user];
+    }
+    
+    /**
+     * @notice Gets the deposit status for a user in the current operation period
+     * @param _user The address to check
+     * @return True if the user has deposited in the current period
+     */
+    function hasUserDepositedCurrentPeriod(address _user) external view returns (bool) {
+        return hasDeposited[currentOperationIndex][_user];
+    }
+    
+    /**
+     * @notice Gets deposit status for a user across all periods
+     * @param _user The address to check
+     * @return depositedPeriods Array of booleans indicating if user deposited in each period (index = period)
+     * @return totalPeriods Total number of periods (operationCounter)
+     */
+    function getUserDepositStatusForAllPeriods(address _user) external view returns (
+        bool[] memory depositedPeriods,
+        uint256 totalPeriods
+    ) {
+        totalPeriods = operationCounter;
+        depositedPeriods = new bool[](totalPeriods);
+        
+        for (uint256 i = 0; i < totalPeriods; i++) {
+            depositedPeriods[i] = hasDeposited[i][_user];
+        }
+        
+        return (depositedPeriods, totalPeriods);
+    }
+    
+    /**
+     * @notice Gets the total deposits for a specific operation period
+     * @param _operationIndex The operation index
+     * @return The total amount deposited in that period
+     */
+    function getPeriodDeposits(uint256 _operationIndex) external view returns (uint256) {
+        return periodDeposits[_operationIndex];
+    }
+    
+    /**
+     * @notice Gets comprehensive information about the group including current period deposits
+     * @return _creator The creator address
+     * @return _verificationType The verification type required
+     * @return _depositFrequency The deposit frequency in seconds
+     * @return _borrowFrequency The borrow frequency in seconds
+     * @return _recurringAmount The recurring deposit amount
+     * @return _operationCounter The total number of operations
+     * @return _currentOperationIndex The current operation index
+     * @return _lastDepositTime The timestamp of last deposit
+     * @return _lastBorrowTime The timestamp of last borrow
+     * @return _minAge Minimum age requirement
+     * @return _allowedNationalities List of allowed nationalities
+     * @return _requiredGender Required gender
+     * @return _currentPeriodDeposits Total deposits in current period
+     * @return _exists Whether the group exists
+     */
+    function getGroupInfoDetailed() external view returns (
+        address _creator,
+        VerificationType _verificationType,
+        uint256 _depositFrequency,
+        uint256 _borrowFrequency,
+        uint256 _recurringAmount,
+        uint256 _operationCounter,
+        uint256 _currentOperationIndex,
+        uint256 _lastDepositTime,
+        uint256 _lastBorrowTime,
+        uint256 _minAge,
+        string[] memory _allowedNationalities,
+        string memory _requiredGender,
+        uint256 _currentPeriodDeposits,
+        bool _exists
+    ) {
+        _exists = groupCreated;
+        return (
+            creator,
+            verificationType,
+            depositFrequency,
+            borrowFrequency,
+            recurringAmount,
+            operationCounter,
+            currentOperationIndex,
+            lastDepositTime,
+            lastBorrowTime,
+            minAge,
+            allowedNationalities,
+            requiredGender,
+            periodDeposits[currentOperationIndex],
+            _exists
+        );
+    }
+    
+    // ============================================================================
+    // VERIFICATION
+    // ============================================================================
+    
+    /**
+     * @notice Implementation of customVerificationHook
+     * @dev Called by onVerificationSuccess after hub address validation
+     * @param output The verification output from the hub
+     * @dev Validates verification requirements based on group's verification type
+     * @dev Emits VerificationCompleted or VerificationFailed event
      */
     function customVerificationHook(
         ISelfVerificationRoot.GenericDiscloseOutputV2 memory output,
-        bytes memory
+        bytes memory /* userData */
     ) internal override {
-        address user = address(uint160(output.userIdentifier));
-
-        // Only mark known members
-        if (!memberInfo[user].exists) {
+        if (!groupCreated) {
+            emit VerificationFailed(groupId, address(0), "Group not created");
             return;
         }
-
-        memberInfo[user].verified = true;
-        emit Verified(user);
+    
+        address verifiedAddress = address(uint160((output.userIdentifier)));
+        
+        // Verify the address is a member of the group
+        if (!members[verifiedAddress]) {
+            emit VerificationFailed(groupId, verifiedAddress, "Address is not a group member");
+            return;
+        }
+        
+        // Check if verification is required for this group
+        if (verificationType == VerificationType.NONE || verificationType == VerificationType.SELF_BASE) {
+            // No verification needed or simple proof of personhood
+            verifiedUsers[verifiedAddress] = true;
+            emit VerificationCompleted(groupId, verifiedAddress, output);
+            return;
+        }
+        
+        // Validate verification requirements based on group type
+        bool requirementsMet = true;
+        string memory failureReason = "";
+        
+        // Check age requirement if needed
+        if (verificationType == VerificationType.SELF_AGE ||
+            verificationType == VerificationType.SELF_AGE_NATIONALITY ||
+            verificationType == VerificationType.SELF_AGE_GENDER ||
+            verificationType == VerificationType.SELF_ALL) {
+            if (output.olderThan < minAge) {
+                requirementsMet = false;
+                failureReason = "Age requirement not met";
+            }
+        }
+        
+        // Check nationality requirement if needed
+        if (requirementsMet && (
+            verificationType == VerificationType.SELF_NATIONALITY ||
+            verificationType == VerificationType.SELF_AGE_NATIONALITY ||
+            verificationType == VerificationType.SELF_NATIONALITY_GENDER ||
+            verificationType == VerificationType.SELF_ALL)) {
+            // If allowed nationalities list is empty, no restriction
+            if (allowedNationalities.length > 0) {
+                bool nationalityFound = false;
+                for (uint256 i = 0; i < allowedNationalities.length; i++) {
+                    if (keccak256(bytes(output.nationality)) == keccak256(bytes(allowedNationalities[i]))) {
+                        nationalityFound = true;
+                        break;
+                    }
+                }
+                if (!nationalityFound) {
+                    requirementsMet = false;
+                    failureReason = "Nationality requirement not met";
+                }
+            }
+        }
+        
+        // Check gender requirement if needed
+        if (requirementsMet && (
+            verificationType == VerificationType.SELF_GENDER ||
+            verificationType == VerificationType.SELF_AGE_GENDER ||
+            verificationType == VerificationType.SELF_NATIONALITY_GENDER ||
+            verificationType == VerificationType.SELF_ALL)) {
+            if (keccak256(bytes(output.gender)) != keccak256(bytes(requiredGender))) {
+                requirementsMet = false;
+                failureReason = "Gender requirement not met";
+            }
+        }
+        
+        if (requirementsMet) {
+            // Mark user as verified
+            verifiedUsers[verifiedAddress] = true;
+            emit VerificationCompleted(groupId, verifiedAddress, output);
+        } else {
+            revert VerificationFailedError(groupId, verifiedAddress, failureReason);
+        }
     }
-
+    
     /**
-     * @notice Return the verification config id previously set in initialize().
-     * @dev Required override for SelfVerificationRoot.
+     * @notice Returns the verification config ID
+     * @return The verification config ID
      */
-    function getConfigId(bytes32, bytes32, bytes memory) public view override returns (bytes32) {
+    function getConfigId(
+        bytes32 /* destinationChainId */,
+        bytes32 /* userIdentifier */,
+        bytes memory /* userDefinedData */
+    ) public view override returns (bytes32) {
         return verificationConfigId;
     }
-
-    /* -------------------------------------------------------------------------- */
-    /*                                  UTIL / VIEW                                */
-    /* -------------------------------------------------------------------------- */
-
-    /// @notice Returns the number of members in the group
-    function membersCount() external view returns (uint256) {
-        return memberList.length;
+    
+    /**
+     * @notice Checks if a user is verified
+     * @param _user The address to check
+     * @return True if the user is verified
+     */
+    function isUserVerified(address _user) external view returns (bool) {
+        return verifiedUsers[_user];
     }
 }
+
