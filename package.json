@@ -1,0 +1,14 @@
+{
+  "name": "ronda-contract",
+  "version": "1.0.0",
+  "description": "Ronda Protocol Smart Contract",
+  "private": true,
+  "scripts": {
+    "extract-abis": "./scripts/extract-abis.sh"
+  },
+  "dependencies": {
+    "@aave/core-v3": "^1.19.3",
+    "@chainlink/contracts": "^1.5.0",
+    "@selfxyz/contracts": "^1.2.3"
+  }
+}

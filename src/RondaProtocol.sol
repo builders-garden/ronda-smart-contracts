@@ -823,7 +823,7 @@ contract RondaProtocol is SelfVerificationRoot {
     ) internal override {
         if (!groupCreated) {
             emit VerificationFailed(groupId, address(0), "Group not created");
-            return;
+            revert VerificationFailedError(groupId, address(0), "Group not created");
         }
     
         address verifiedAddress = address(uint160((output.userIdentifier)));
@@ -831,7 +831,7 @@ contract RondaProtocol is SelfVerificationRoot {
         // Verify the address is a member of the group
         if (!members[verifiedAddress]) {
             emit VerificationFailed(groupId, verifiedAddress, "Address is not a group member");
-            return;
+            revert VerificationFailedError(groupId, verifiedAddress, "Address is not a group member");
         }
         
         // Check if verification is required for this group
@@ -841,7 +841,6 @@ contract RondaProtocol is SelfVerificationRoot {
             emit VerificationCompleted(groupId, verifiedAddress, output);
             return;
         }
-        
         // Validate verification requirements based on group type
         bool requirementsMet = true;
         string memory failureReason = "";
