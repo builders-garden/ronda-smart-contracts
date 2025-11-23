@@ -10,20 +10,35 @@ import {IIdentityVerificationHubV2} from "@selfxyz/contracts/interfaces/IIdentit
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+/**
+ * Minimal subset of Aave v3 Pool interface used here.
+ * This is intentionally small — only supply & withdraw functions we need.
+ */
+interface IPool {
+    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
 }
 
 enum VerificationType {
     NONE,
-    SELF
+    SELF_BASE,        // proof of personhood only
+    SELF_AGE,         // proof of personhood + age requirement
+    SELF_NATIONALITY  // proof of personhood + nationality requirement
 }
 
 contract RondaProtocol is SelfVerificationRoot {
-
     /* -------------------------------------------------------------------------- */
     /*                                   STORAGE                                  */
     /* -------------------------------------------------------------------------- */
 
     IERC20 public usdc;
+    IPool public aavePool;
+    IERC20 public aaveUsdc; // aUSDC token (interest bearing)
+
     address public creator;
 
     uint256 public groupId;
@@ -31,7 +46,7 @@ contract RondaProtocol is SelfVerificationRoot {
     bool public initialized;
 
     VerificationType public verificationType;
-    uint256 public recurringAmount;     // **per round deposit amount**
+    uint256 public recurringAmount;     // per round deposit amount
 
     struct MemberInfo {
         bool exists;
@@ -77,20 +92,34 @@ contract RondaProtocol is SelfVerificationRoot {
     /*                                  INITIALIZE                                */
     /* -------------------------------------------------------------------------- */
 
+    /**
+     * @notice Initialize contract with group id, USDC, identity hub and Aave addresses.
+     * @dev This is an evolution over the original initialize: adds Aave wiring so deposits can earn interest.
+     */
     function initialize(
         uint256 _groupId,
         address _usdc,
         address identityVerificationHubV2Address,
+        address _aavePool,
+        address _aaveUsdc,
         SelfUtils.UnformattedVerificationConfigV2 memory _verificationConfig
     ) external {
-        require(!initialized);
+        require(!initialized, "Already initialized");
         initialized = true;
 
         groupId = _groupId;
         usdc = IERC20(_usdc);
 
+        // Aave integration (can be address(0) for deployments that don't use Aave yet)
+        if (_aavePool != address(0)) {
+            aavePool = IPool(_aavePool);
+        }
+        if (_aaveUsdc != address(0)) {
+            aaveUsdc = IERC20(_aaveUsdc);
+        }
+
         verificationConfig = SelfUtils.formatVerificationConfigV2(_verificationConfig);
-        verificationConfigId = 
+        verificationConfigId =
             IIdentityVerificationHubV2(identityVerificationHubV2Address)
             .setVerificationConfigV2(verificationConfig);
     }
@@ -136,16 +165,30 @@ contract RondaProtocol is SelfVerificationRoot {
     /*                                 DEPOSIT                                    */
     /* -------------------------------------------------------------------------- */
 
+    /**
+     * @notice Deposit recurringAmount of USDC for the current round.
+     * @dev New in this intermediate commit: deposits are auto-supplied to Aave if pool is configured.
+     */
     function deposit() external {
         require(memberInfo[msg.sender].exists, "Not member");
         require(!depositedInRound[currentRound][msg.sender], "Already deposited");
 
-        if (verificationType == VerificationType.SELF) {
+        if (verificationType == VerificationType.SELF_BASE ||
+            verificationType == VerificationType.SELF_AGE ||
+            verificationType == VerificationType.SELF_NATIONALITY
+        ) {
             require(memberInfo[msg.sender].verified, "Not verified");
         }
 
-        // force exact amount
-        require(usdc.transferFrom(msg.sender, address(this), recurringAmount));
+        // Transfer USDC from user to contract
+        require(usdc.transferFrom(msg.sender, address(this), recurringAmount), "USDC transfer failed");
+
+        // If Aave pool configured, approve & supply to Aave to earn interest
+        if (address(aavePool) != address(0)) {
+            require(usdc.approve(address(aavePool), recurringAmount), "Approve to Aave failed");
+            // supply will send aUSDC to this contract on success; we don't need to track aUSDC balance here
+            aavePool.supply(address(usdc), recurringAmount, address(this), 0);
+        }
 
         depositedInRound[currentRound][msg.sender] = true;
         depositsThisRound += 1;
@@ -158,6 +201,11 @@ contract RondaProtocol is SelfVerificationRoot {
     /*                             ROUND COMPLETION                                */
     /* -------------------------------------------------------------------------- */
 
+    /**
+     * @notice Picks winner and pays out totalPool.
+     * @dev Intermediate commit: before paying, withdraws from Aave (if configured) to ensure liquidity.
+     *      This commit does not yet add feeRecipient/operator logic or advanced distribution of interest.
+     */
     function payout() external {
         require(groupCreated, "Not created");
         require(depositsThisRound == memberList.length, "Round incomplete");
@@ -165,10 +213,9 @@ contract RondaProtocol is SelfVerificationRoot {
 
         // build eligible list (members who haven't won this cycle)
         address[] memory eligible = _eligibleMembers();
-
         require(eligible.length > 0, "All have won");
 
-        // random pick among eligible
+        // random pick among eligible (same PRNG as before)
         uint256 random = uint256(
             keccak256(
                 abi.encodePacked(
@@ -182,8 +229,15 @@ contract RondaProtocol is SelfVerificationRoot {
 
         address winner = eligible[random % eligible.length];
 
+        // If we used Aave, withdraw the required amount back to this contract
+        if (address(aavePool) != address(0)) {
+            // withdraw returns amount actually withdrawn; send to this contract and then forward
+            uint256 withdrawn = aavePool.withdraw(address(usdc), totalPool, address(this));
+            require(withdrawn >= totalPool, "Aave withdraw short");
+        }
+
         // transfer winnings
-        require(usdc.transfer(winner, totalPool));
+        require(usdc.transfer(winner, totalPool), "USDC transfer to winner failed");
 
         emit Winner(winner, totalPool, currentRound);
 
@@ -249,11 +303,21 @@ contract RondaProtocol is SelfVerificationRoot {
 
         if (!memberInfo[user].exists) return;
 
+        // In this intermediate commit we simply set verified=true on successful disclosure.
+        // Future commits will validate age/nationality fields depending on verificationType.
         memberInfo[user].verified = true;
         emit Verified(user);
     }
 
     function getConfigId(bytes32, bytes32, bytes memory) public view override returns (bytes32) {
         return verificationConfigId;
+    }
+
+    /* -------------------------------------------------------------------------- */
+    /*                                  UTIL / VIEW                                */
+    /* -------------------------------------------------------------------------- */
+
+    function membersCount() external view returns (uint256) {
+        return memberList.length;
     }
 }
